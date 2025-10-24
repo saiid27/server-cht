@@ -16,9 +16,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 7);
 const SESSION_TTL_SECONDS = Math.max(60, Math.ceil(SESSION_TTL_MS / 1000));
 
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-const redis = KV_URL && KV_TOKEN ? new Redis({ url: KV_URL, token: KV_TOKEN }) : null;
+const redis = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+  ? Redis.fromEnv()
+  : process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
+    ? new Redis({ url: process.env.KV_REST_API_URL, token: process.env.KV_REST_API_TOKEN })
+    : null;
 
 const DEFAULT_PRODUCTS = [
   { id: "netflix_1", name_ar: "نتفلكس 4K (بروفايل خاص)", cat: "منصات ترفيه", duration: "شهر واحد", price: 270, img: "/ntflx.jpg", keywords: "netflix uhd 4k" },
