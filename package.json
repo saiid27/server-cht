@@ -11,12 +11,13 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "better-sqlite3": "^12.4.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "helmet": "^8.1.0",
+    "@upstash/redis": "^1.29.2",
+    "serverless-http": "^3.2.0",
     "zod": "^4.1.11"
   }
 }

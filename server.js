@@ -1,125 +1,52 @@
-﻿// server.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const Database = require("better-sqlite3");
 const crypto = require("crypto");
+const { Redis } = require("@upstash/redis");
 const { z } = require("zod");
 
 const app = express();
+
 const PORT = process.env.PORT || 8080;
 const ORIGIN = process.env.ORIGIN || "*";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "22234605765";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 7);
-const DB_PATH = process.env.DB_PATH || "./echtiraki.db";
+const SESSION_TTL_SECONDS = Math.max(60, Math.ceil(SESSION_TTL_MS / 1000));
 
-// أمان أساسي
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const redis = KV_URL && KV_TOKEN ? new Redis({ url: KV_URL, token: KV_TOKEN }) : null;
+
+const DEFAULT_PRODUCTS = [
+  { id: "netflix_1", name_ar: "نتفلكس 4K (بروفايل خاص)", cat: "منصات ترفيه", duration: "شهر واحد", price: 270, img: "/ntflx.jpg", keywords: "netflix uhd 4k" },
+  { id: "netflix_3", name_ar: "نتفلكس 4K (بروفايل خاص)", cat: "منصات ترفيه", duration: "3 أشهر", price: 500, img: "/ntflx.jpg", keywords: "netflix uhd 4k" },
+  { id: "chatgpt_plus_1", name_ar: "شات جي بي تي بلس (حساب مشترك)", cat: "أدوات إنتاجية", duration: "شهر واحد", price: 280, img: "/gpt.jpg", keywords: "chatgpt gpt plus" },
+  { id: "chatgpt_plus_3", name_ar: "شات جي بي تي بلس (حساب مشترك)", cat: "أدوات إنتاجية", duration: "3 أشهر", price: 800, img: "/gpt.jpg", keywords: "chatgpt gpt plus" },
+  { id: "chatgpt_plus_private", name_ar: "شات جي بي تي بلس (حساب خاص)", cat: "أدوات إنتاجية", duration: "شهر واحد", price: 880, img: "/gpt.jpg", keywords: "chatgpt gpt plus private" },
+  { id: "snap_plus_3", name_ar: "سناب شات بلس", cat: "منصات تواصل", duration: "3 أشهر", price: 270, img: "/snapchat.jpg", keywords: "snapchat plus" },
+  { id: "snap_plus_6", name_ar: "سناب شات بلس", cat: "منصات تواصل", duration: "6 أشهر", price: 500, img: "/snapchat.jpg", keywords: "snapchat plus" },
+  { id: "canva_pro", name_ar: "كانفا برو (حساب مشترك)", cat: "تصميم وإبداع", duration: "غير محدود", price: 200, img: "/canva.jpg", keywords: "canva pro design" },
+  { id: "capcut_pro", name_ar: "كاب كت برو (حساب خاص)", cat: "تصميم وإبداع", duration: "شهر واحد", price: 800, img: "/capcut.jpg", keywords: "capcut pro" },
+  { id: "meta_verified", name_ar: "ميتا فيريفيد", cat: "تصميم وإبداع", duration: "شهر واحد", price: 800, img: "/meta.jpg", keywords: "meta verified" },
+  { id: "adobe_suite", name_ar: "أدوبي كرياتيف كلاود", cat: "تصميم وإبداع", duration: "غير محدود", price: 1000, img: "/adobe.jpg", keywords: "adobe photoshop illustrator" },
+];
+
 app.use(helmet());
 app.use(cors({ origin: ORIGIN, credentials: true }));
 app.use(express.json({ limit: "200kb" }));
-app.use(rateLimit({ windowMs: 60_000, max: 120 })); // 120 طلب/دقيقة
+app.use(rateLimit({ windowMs: 60_000, max: 120 }));
 
-// قاعدة بيانات SQLite (ملف على القرص)
-const db = new Database(DB_PATH);
-db.pragma("foreign_keys = ON");
-// إنشاء الجداول عند أول تشغيل
-db.exec(`
-  PRAGMA journal_mode = WAL;
-
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    full_name TEXT NOT NULL,
-    phone TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    expires_at TEXT NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS products (
-    id TEXT PRIMARY KEY,
-    name_ar TEXT NOT NULL,
-    cat TEXT NOT NULL,
-    duration TEXT,
-    price INTEGER NOT NULL,
-    img TEXT,
-    keywords TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
-    product_id TEXT NOT NULL,
-    product_name TEXT NOT NULL,
-    duration TEXT,
-    price INTEGER NOT NULL,
-    full_name TEXT NOT NULL,
-    phone TEXT NOT NULL,
-    email TEXT,
-    notes TEXT,
-    status TEXT NOT NULL DEFAULT 'pending', -- pending | paid | delivered | canceled
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    user_id TEXT,
-    FOREIGN KEY (product_id) REFERENCES products(id),
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-`);
-
-const orderColumns = db.prepare("PRAGMA table_info(orders)").all();
-if (!orderColumns.some((col) => col.name === "user_id")) {
-  db.exec("ALTER TABLE orders ADD COLUMN user_id TEXT");
-}
-
-// إدخال منتجات (مرة واحدة) لو الجدول فاضي
-const count = db.prepare("SELECT COUNT(*) as c FROM products").get().c;
-if (count === 0) {
-  const seed = db.prepare(`
-    INSERT INTO products (id, name_ar, cat, duration, price, img, keywords)
-    VALUES (@id, @name_ar, @cat, @duration, @price, @img, @keywords)
-  `);
-
-  const products = [
-    { id:"_uhd", name_ar:"Netflix 4K (حساب مشترك )", cat:"الترفيه", duration:"1 mois", price:270, img:"/ntflx.jpg", keywords:"نتفلكس Netflix UHD 4K" },
-    { id:"netflix_uhd", name_ar:"Netflix 4K (حساب مشترك )", cat:"الترفيه", duration:"3 mois", price:500, img:"/ntflx.jpg", keywords:"نتفلكس Netflix UHD 4K" },
-
-    { id:"chatgpt_plus_1", name_ar:"chat-gpt plus(حساب مشترك )", cat:"الذكاء الاصطناعي", duration:"1 mois", price:280, img:"/gpt.jpg", keywords:"شات جي بي تي chat-gpt gpt" },
-    { id:"chatgpt_plus_3", name_ar:"chat-gpt plus (حساب مشترك )", cat:"الذكاء الاصطناعي", duration:"3 mois", price:800, img:"/gpt.jpg", keywords:"شات جي بي تي chat-gpt gpt" },
-    { id:"chatgpt_plus_private", name_ar:"chat-gpt plus (حساب خاص )", cat:"الذكاء الاصطناعي", duration:"1 mois", price:880, img:"/gpt.jpg", keywords:"شات جي بي تي chat-gpt gpt" },
-
-    { id:"snap_plus_3", name_ar:"snap chat- plus", cat:"الترفيه", duration:"3 mois", price:270, img:"/snapchat.jpg", keywords:"سناب شات snap plus" },
-    { id:"snap_plus_6", name_ar:"snap chat- plus", cat:"الترفيه", duration:"6 mois", price:500, img:"/snapchat.jpg", keywords:"سناب شات snap plus" },
-
-    { id:"canva_pro", name_ar:"canva pro (حساب خاص )", cat:"الترويج", duration:"infinie-مدى الحياة", price:200, img:"/canva.jpg", keywords:"كانفا canva pro" },
-    { id:"capcut_pro", name_ar:" capcut pro (حساب خاص )", cat:"الترويج", duration:"1 mois", price:800, img:"/capcut.jpg", keywords:"كابكات capcut pro" },
-    { id:"meta_verified", name_ar:"meta verified-توثيق صفحة فيسبوك ", cat:"الترويج", duration:"1 mois", price:800, img:"/meta.jpg", keywords:"فيسبوك توثيق meta" },
-    { id:"adobe_suite", name_ar:"adobe برامج فوتوشوب ", cat:"الترويج", duration:"infinie-مدى الحياة", price:1000, img:"/adobe.jpg", keywords:"adobe photoshop illustrator" },
-  ];
-
-  const insert = db.transaction((items) => {
-    for (const p of items) seed.run(p);
-  });
-  insert(products);
-  console.log("Seeded products ✅");
-}
-
-// مخططات التحقق
 const CreateOrderSchema = z.object({
   productId: z.string().min(1),
-  fullName: z.string().min(2).or(z.literal("")).optional(),
-  phone: z.string().min(6).or(z.literal("")).optional(),
+  fullName: z.string().min(2).optional().or(z.literal("")),
+  phone: z.string().min(6).optional().or(z.literal("")),
   email: z.string().email().optional().or(z.literal("")),
   notes: z.string().max(1000).optional().or(z.literal("")),
 });
 
-// مساعد: مُعرّف طلب عشوائي قصير
 const RegisterSchema = z.object({
   fullName: z.string().min(2).max(120),
   phone: z.string().min(6).max(30),
@@ -131,11 +58,42 @@ const LoginSchema = z.object({
   password: z.string().min(6).max(128),
 });
 
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+function assertRedis() {
+  if (!redis) {
+    throw new Error("KV storage is not configured. Set KV_REST_API_URL and KV_REST_API_TOKEN.");
+  }
+  return redis;
+}
+
+let seedPromise = null;
+async function ensureSeeded() {
+  assertRedis();
+  if (seedPromise) return seedPromise;
+  seedPromise = (async () => {
+    const exists = await redis.exists("products");
+    if (!exists) {
+      await redis.set("products", DEFAULT_PRODUCTS);
+    }
+  })();
+  return seedPromise;
+}
+
+async function getProducts() {
+  await ensureSeeded();
+  return (await redis.get("products")) || [];
+}
+
+async function getProductById(id) {
+  const products = await getProducts();
+  return products.find((product) => product.id === id) || null;
+}
+
 function normalizePhone(value = "") {
   if (!value) return "";
   const trimmed = String(value).trim();
   if (!trimmed) return "";
-
   const withoutSpaces = trimmed.replace(/\s+/g, "");
   const hasPlus = withoutSpaces.startsWith("+");
   const digits = withoutSpaces.replace(/[^\d]/g, "");
@@ -155,314 +113,416 @@ function verifyPassword(password, salt, storedHash) {
     const storedBuffer = Buffer.from(storedHash, "hex");
     if (hashBuffer.length !== storedBuffer.length) return false;
     return crypto.timingSafeEqual(hashBuffer, storedBuffer);
-  } catch (err) {
+  } catch {
     return false;
   }
 }
 
-function createSession(userId) {
-  const token = crypto.randomBytes(48).toString("hex");
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-
-  db.prepare(`
-    INSERT INTO sessions (id, user_id, expires_at)
-    VALUES (@id, @user_id, @expires_at)
-  `).run({ id: token, user_id: userId, expires_at: expiresAt });
-
-  return { token, expiresAt };
-}
-
-function deleteSession(token) {
-  db.prepare("DELETE FROM sessions WHERE id = ?").run(token);
-}
-
-function getSession(token) {
-  if (!token) return null;
-  const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(token);
-  if (!session) return null;
-
-  if (Date.parse(session.expires_at) <= Date.now()) {
-    deleteSession(token);
-    return null;
-  }
-
-  return session;
-}
-
-function loadUser(userId) {
-  return db.prepare("SELECT id, full_name, phone, created_at FROM users WHERE id = ?").get(userId);
-}
-
-function loadUserByPhone(phone) {
-  return db.prepare("SELECT id, full_name, phone, password_hash, password_salt, created_at FROM users WHERE phone = ?").get(phone);
-}
-
-function toPublicUser(row) {
-  if (!row) return null;
+function toPublicUser(user) {
+  if (!user) return null;
   return {
-    id: row.id,
-    fullName: row.full_name,
-    phone: row.phone,
-    createdAt: row.created_at,
+    id: user.id,
+    fullName: user.full_name,
+    phone: user.phone,
+    createdAt: user.created_at,
   };
 }
 
-function extractToken(req) {
-  const authHeader = req.get("authorization");
-  if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
-    return authHeader.slice(7).trim();
-  }
-
-  const headerToken = req.get("x-session-token");
-  return headerToken ? headerToken.trim() : null;
+function newId(prefix = "ord") {
+  return `${prefix}_${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-4)}`;
 }
 
-function authenticateRequest(req) {
-  const token = extractToken(req);
+async function getUserById(id) {
+  if (!id) return null;
+  await ensureSeeded();
+  return (await redis.get(`user:${id}`)) || null;
+}
+
+async function getUserByPhone(phone) {
+  if (!phone) return null;
+  await ensureSeeded();
+  const userId = await redis.get(`user:phone:${phone}`);
+  if (!userId) return null;
+  return getUserById(userId);
+}
+
+async function saveUser(user) {
+  await ensureSeeded();
+  await redis.set(`user:${user.id}`, user);
+  await redis.set(`user:phone:${user.phone}`, user.id);
+}
+
+async function createSession(userId) {
+  await ensureSeeded();
+  const token = crypto.randomBytes(48).toString("hex");
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + SESSION_TTL_MS);
+  const session = {
+    id: token,
+    user_id: userId,
+    created_at: createdAt.toISOString(),
+    expires_at: expiresAt.toISOString(),
+  };
+  await redis.set(`session:${token}`, session, { ex: SESSION_TTL_SECONDS });
+  return { token, expiresAt: session.expires_at };
+}
+
+async function getSession(token) {
   if (!token) return null;
+  await ensureSeeded();
+  return (await redis.get(`session:${token}`)) || null;
+}
 
-  const session = getSession(token);
+async function deleteSession(token) {
+  if (!token) return;
+  await ensureSeeded();
+  await redis.del(`session:${token}`);
+}
+
+async function authenticateRequest(req) {
+  const authHeader = req.get("authorization");
+  let token = null;
+  if (authHeader && typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")) {
+    token = authHeader.slice(7).trim();
+  } else {
+    const headerToken = req.get("x-session-token");
+    token = headerToken ? headerToken.trim() : null;
+  }
+
+  if (!token) return null;
+  const session = await getSession(token);
   if (!session) return null;
-
-  const userRow = loadUser(session.user_id);
-  if (!userRow) {
-    deleteSession(token);
+  const user = await getUserById(session.user_id);
+  if (!user) {
+    await deleteSession(token);
     return null;
   }
 
-  return { token, session, user: toPublicUser(userRow) };
+  return {
+    token,
+    session,
+    user: toPublicUser(user),
+  };
 }
 
 function requireAuth(req, res, next) {
-  const auth = authenticateRequest(req);
-  if (!auth) return res.status(401).json({ error: "UNAUTHORIZED" });
-  req.auth = auth;
-  next();
+  authenticateRequest(req)
+    .then((auth) => {
+      if (!auth) return res.status(401).json({ error: "UNAUTHORIZED" });
+      req.auth = auth;
+      next();
+    })
+    .catch(next);
 }
 
-app.post("/api/auth/register", (req, res) => {
-  const parsed = RegisterSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.errors });
-  }
-
-  const fullName = parsed.data.fullName.trim();
-  const phone = normalizePhone(parsed.data.phone);
-  const password = parsed.data.password;
-
-  if (!phone) {
-    return res.status(400).json({ error: "INVALID_PHONE" });
-  }
-
-  const existing = db.prepare("SELECT id FROM users WHERE phone = ?").get(phone);
-  if (existing) {
-    return res.status(409).json({ error: "USER_EXISTS" });
-  }
-
-  const { hash, salt } = hashPassword(password);
-  const userId = newId("usr");
-
-  db.prepare(`
-    INSERT INTO users (id, full_name, phone, password_hash, password_salt)
-    VALUES (@id, @full_name, @phone, @password_hash, @password_salt)
-  `).run({
-    id: userId,
-    full_name: fullName,
-    phone,
-    password_hash: hash,
-    password_salt: salt,
-  });
-
-  const session = createSession(userId);
-  const userRow = loadUser(userId);
-
-  res.status(201).json({
-    token: session.token,
-    expiresAt: session.expiresAt,
-    user: toPublicUser(userRow),
-  });
-});
-
-app.post("/api/auth/login", (req, res) => {
-  const parsed = LoginSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.errors });
-  }
-
-  const phone = normalizePhone(parsed.data.phone);
-  const password = parsed.data.password;
-
-  if (!phone) {
-    return res.status(400).json({ error: "INVALID_PHONE" });
-  }
-
-  const userRow = loadUserByPhone(phone);
-  if (!userRow || !verifyPassword(password, userRow.password_salt, userRow.password_hash)) {
-    return res.status(401).json({ error: "INVALID_CREDENTIALS" });
-  }
-
-  const session = createSession(userRow.id);
-
-  res.json({
-    token: session.token,
-    expiresAt: session.expiresAt,
-    user: toPublicUser(userRow),
-  });
-});
-
-app.post("/api/auth/logout", requireAuth, (req, res) => {
-  deleteSession(req.auth.token);
-  res.status(204).send();
-});
-
-app.get("/api/auth/me", requireAuth, (req, res) => {
-  res.json({
-    user: req.auth.user,
-    expiresAt: req.auth.session.expires_at,
-  });
-});
-
-function newId(prefix="ord") {
-  return `${prefix}_${Math.random().toString(36).slice(2,8)}${Date.now().toString(36).slice(-4)}`;
+async function saveOrder(order) {
+  await ensureSeeded();
+  await redis.set(`order:${order.id}`, order);
+  await redis.lpush(`orders:user:${order.user_id}`, order.id);
 }
 
-/* ========== APIs ========== */
-
-// التصنيفات
-app.get("/api/categories", (req, res) => {
-  const rows = db.prepare("SELECT DISTINCT cat FROM products ORDER BY cat").all();
-  res.json(rows.map(r => r.cat));
-});
-
-// كل المنتجات أو حسب تصنيف
-app.get("/api/products", (req, res) => {
-  const { cat, q } = req.query;
-
-  let sql = "SELECT * FROM products";
-  const where = [];
-  const params = {};
-
-  if (cat && cat !== "الكل") { where.push("cat = @cat"); params.cat = cat; }
-  if (q) { where.push("(LOWER(name_ar) LIKE @q OR LOWER(keywords) LIKE @q)"); params.q = `%${String(q).toLowerCase()}%`; }
-
-  if (where.length) sql += " WHERE " + where.join(" AND ");
-  sql += " ORDER BY name_ar";
-
-  const rows = db.prepare(sql).all(params);
-  res.json(rows);
-});
-
-app.get("/api/orders", requireAuth, (req, res) => {
-  const orders = db.prepare(`
-    SELECT *
-    FROM orders
-    WHERE user_id = ?
-    ORDER BY datetime(created_at) DESC
-  `).all(req.auth.user.id);
-
-  res.json(orders);
-});
-
-// إنشاء طلب
-app.post("/api/orders", requireAuth, (req, res) => {
-  const parse = CreateOrderSchema.safeParse(req.body);
-  if (!parse.success) {
-    return res.status(400).json({ error: "INVALID_INPUT", details: parse.error.errors });
+async function getOrdersForUser(userId) {
+  await ensureSeeded();
+  const ids = await redis.lrange(`orders:user:${userId}`, 0, -1);
+  if (!ids || ids.length === 0) return [];
+  const seen = new Set();
+  const result = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const order = await redis.get(`order:${id}`);
+    if (order) result.push(order);
   }
+  return result.sort((a, b) => Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0));
+}
 
-  const { productId, fullName, phone, email, notes } = parse.data;
+async function getOrderById(id) {
+  await ensureSeeded();
+  return (await redis.get(`order:${id}`)) || null;
+}
 
-  const user = req.auth.user;
-  const buyerName = typeof fullName === "string" && fullName.trim().length >= 2 ? fullName.trim() : user.fullName;
-  const normalizedUserPhone = normalizePhone(user.phone);
-  const submittedPhone = typeof phone === "string" ? phone : "";
-  const contactPhone = normalizePhone(submittedPhone) || normalizedUserPhone;
+app.post(
+  "/api/auth/register",
+  asyncHandler(async (req, res) => {
+    const parsed = RegisterSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.errors });
+    }
 
-  if (!contactPhone) {
-    return res.status(400).json({ error: "INVALID_PHONE" });
-  }
+    assertRedis();
+    const fullName = parsed.data.fullName.trim();
+    const phone = normalizePhone(parsed.data.phone);
+    if (!phone) {
+      return res.status(400).json({ error: "INVALID_PHONE" });
+    }
 
-  const contactEmail = email && email.trim() ? email.trim() : null;
-  const orderNotes = notes && notes.trim() ? notes.trim() : null;
+    const existing = await getUserByPhone(phone);
+    if (existing) {
+      return res.status(409).json({ error: "USER_EXISTS" });
+    }
 
-  const product = db.prepare("SELECT * FROM products WHERE id = ?").get(productId);
-  if (!product) return res.status(404).json({ error: "PRODUCT_NOT_FOUND" });
+    const { hash, salt } = hashPassword(parsed.data.password);
+    const userId = newId("usr");
+    const createdAt = new Date().toISOString();
+    const user = {
+      id: userId,
+      full_name: fullName,
+      phone,
+      password_hash: hash,
+      password_salt: salt,
+      created_at: createdAt,
+    };
 
-  const id = newId();
-  db.prepare(`
-    INSERT INTO orders (id, user_id, product_id, product_name, duration, price, full_name, phone, email, notes, status)
-    VALUES (@id, @user_id, @product_id, @product_name, @duration, @price, @full_name, @phone, @email, @notes, 'pending')
-  `).run({
-    id,
-    user_id: user.id,
-    product_id: product.id,
-    product_name: product.name_ar,
-    duration: product.duration,
-    price: product.price,
-    full_name: buyerName,
-    phone: contactPhone,
-    email: contactEmail,
-    notes: orderNotes,
-  });
+    await saveUser(user);
+    const session = await createSession(userId);
 
-  // رابط واتساب جاهز (اختياري ترسله للفرونت)
-  const text = [
-    "🛒 *فاتورة طلب اشتراك*",
-    `• المنتج: ${product.name_ar}`,
-    `• المدة: ${product.duration}`,
-    `• السعر: ${product.price} MRU`,
-    "— — —",
-    `• الاسم: ${buyerName}`,
-    `• الواتساب: ${contactPhone}`,
-    email ? `• البريد: ${email}` : null,
-    notes ? `• ملاحظات: ${notes}` : null,
-    `• رقم الطلب: ${id}`,
-    `• وقت الإرسال: ${new Date().toLocaleString()}`,
-  ].filter(Boolean).join("\n");
+    res.status(201).json({
+      token: session.token,
+      expiresAt: session.expiresAt,
+      user: toPublicUser(user),
+    });
+  })
+);
 
-  const wa = `https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(text)}`;
+app.post(
+  "/api/auth/login",
+  asyncHandler(async (req, res) => {
+    const parsed = LoginSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "INVALID_INPUT", details: parsed.error.errors });
+    }
 
-  res.status(201).json({ id, status: "pending", whatsappLink: wa });
+    assertRedis();
+    const phone = normalizePhone(parsed.data.phone);
+    if (!phone) {
+      return res.status(400).json({ error: "INVALID_PHONE" });
+    }
+
+    const user = await getUserByPhone(phone);
+    if (!user || !verifyPassword(parsed.data.password, user.password_salt, user.password_hash)) {
+      return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+    }
+
+    const session = await createSession(user.id);
+
+    res.json({
+      token: session.token,
+      expiresAt: session.expiresAt,
+      user: toPublicUser(user),
+    });
+  })
+);
+
+app.post(
+  "/api/auth/logout",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await deleteSession(req.auth.token);
+    res.status(204).send();
+  })
+);
+
+app.get(
+  "/api/auth/me",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json({
+      user: req.auth.user,
+      expiresAt: req.auth.session.expires_at,
+    });
+  })
+);
+
+app.get(
+  "/api/categories",
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    const products = await getProducts();
+    const categories = Array.from(
+      new Set(
+        products
+          .map((product) => product.cat)
+          .filter((cat) => typeof cat === "string" && cat.trim().length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b, "ar"));
+
+    res.json(categories);
+  })
+);
+
+app.get(
+  "/api/products",
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    let products = await getProducts();
+
+    const cat = req.query.cat ? String(req.query.cat) : null;
+    const q = req.query.q ? String(req.query.q).toLowerCase() : null;
+
+    if (cat && cat !== "الكل") {
+      products = products.filter((product) => product.cat === cat);
+    }
+
+    if (q) {
+      products = products.filter((product) => {
+        const haystack = `${product.name_ar} ${product.keywords}`.toLowerCase();
+        return haystack.includes(q);
+      });
+    }
+
+    res.json(products);
+  })
+);
+
+app.get(
+  "/api/orders",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    const orders = await getOrdersForUser(req.auth.user.id);
+    res.json(orders);
+  })
+);
+
+app.post(
+  "/api/orders",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    const parse = CreateOrderSchema.safeParse(req.body);
+    if (!parse.success) {
+      return res.status(400).json({ error: "INVALID_INPUT", details: parse.error.errors });
+    }
+
+    const { productId, fullName, phone, email, notes } = parse.data;
+    const product = await getProductById(productId);
+    if (!product) {
+      return res.status(404).json({ error: "PRODUCT_NOT_FOUND" });
+    }
+
+    const user = req.auth.user;
+    const buyerName = typeof fullName === "string" && fullName.trim().length >= 2 ? fullName.trim() : user.fullName;
+    const submittedPhone = typeof phone === "string" ? phone : "";
+    const contactPhone = normalizePhone(submittedPhone) || normalizePhone(user.phone);
+    if (!contactPhone) {
+      return res.status(400).json({ error: "INVALID_PHONE" });
+    }
+
+    const contactEmail = email && email.trim() ? email.trim() : null;
+    const orderNotes = notes && notes.trim() ? notes.trim() : null;
+
+    const id = newId();
+    const createdAt = new Date().toISOString();
+    const order = {
+      id,
+      user_id: user.id,
+      product_id: product.id,
+      product_name: product.name_ar,
+      duration: product.duration,
+      price: product.price,
+      full_name: buyerName,
+      phone: contactPhone,
+      email: contactEmail,
+      notes: orderNotes,
+      status: "pending",
+      created_at: createdAt,
+    };
+
+    await saveOrder(order);
+
+    const text = [
+      "طلب جديد عبر موقع إشتراكي",
+      `المنتج: ${product.name_ar}`,
+      `مدة الاشتراك: ${product.duration}`,
+      `السعر: ${product.price} MRU`,
+      "----",
+      `العميل: ${buyerName}`,
+      `الهاتف: ${contactPhone}`,
+      contactEmail ? `البريد: ${contactEmail}` : null,
+      orderNotes ? `ملاحظات: ${orderNotes}` : null,
+      `رقم الطلب: ${id}`,
+      `تاريخ الطلب: ${new Date(createdAt).toLocaleString()}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const wa = `https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(text)}`;
+    res.status(201).json({ id, status: "pending", whatsappLink: wa });
+  })
+);
+
+app.get(
+  "/api/orders/:id",
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    const order = await getOrderById(req.params.id);
+    if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+
+    const adminKey = req.get("x-admin-key");
+    if (adminKey && adminKey === ADMIN_KEY) {
+      return res.json(order);
+    }
+
+    const auth = await authenticateRequest(req);
+    if (!auth) return res.status(401).json({ error: "UNAUTHORIZED" });
+    if (order.user_id !== auth.user.id) {
+      return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+    }
+
+    res.json(order);
+  })
+);
+
+app.put(
+  "/api/orders/:id/status",
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    const key = req.header("x-admin-key");
+    if (key !== ADMIN_KEY) {
+      return res.status(401).json({ error: "UNAUTHORIZED" });
+    }
+
+    const allowed = new Set(["pending", "paid", "delivered", "canceled"]);
+    const { status } = req.body || {};
+    if (!allowed.has(status)) {
+      return res.status(400).json({ error: "INVALID_STATUS" });
+    }
+
+    const order = await getOrderById(req.params.id);
+    if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+
+    order.status = status;
+    await redis.set(`order:${order.id}`, order);
+
+    res.json({ id: order.id, status });
+  })
+);
+
+app.get(
+  "/health",
+  asyncHandler(async (req, res) => {
+    assertRedis();
+    await ensureSeeded();
+    res.json({ ok: true });
+  })
+);
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "INTERNAL_ERROR" });
 });
 
-// الحصول على طلب برقم التتبّع
-app.get("/api/orders/:id", (req, res) => {
-  const adminKey = req.get("x-admin-key");
-  if (adminKey && adminKey === process.env.ADMIN_KEY) {
-    const row = db.prepare("SELECT * FROM orders WHERE id = ?").get(req.params.id);
-    if (!row) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-    return res.json(row);
-  }
+if (require.main === module) {
+  ensureSeeded()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`API listening on http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error("Failed to initialize KV storage:", err);
+      process.exit(1);
+    });
+}
 
-  const auth = authenticateRequest(req);
-  if (!auth) return res.status(401).json({ error: "UNAUTHORIZED" });
-
-  const row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(req.params.id, auth.user.id);
-  if (!row) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-
-  res.json(row);
-});
-
-// (اختياري) تحديث حالة الطلب — اجعلها محمية بمفتاح سري بسيط
-app.put("/api/orders/:id/status", (req, res) => {
-  const key = req.header("x-admin-key");
-  if (key !== process.env.ADMIN_KEY) return res.status(401).json({ error: "UNAUTHORIZED" });
-
-  const allowed = new Set(["pending", "paid", "delivered", "canceled"]);
-  const { status } = req.body || {};
-  if (!allowed.has(status)) return res.status(400).json({ error: "INVALID_STATUS" });
-
-  const info = db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(status, req.params.id);
-  if (info.changes === 0) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-
-  res.json({ id: req.params.id, status });
-});
-
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
-});
-
-
-
+module.exports = app;
